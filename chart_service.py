@@ -1,4 +1,5 @@
-import io
+import matplotlib
+matplotlib.use("Agg")import io
 import base64
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
@@ -15,8 +16,10 @@ POINT_X_CELL = "Qualitative Inputs!N25"
 POINT_Y_CELL = "Qualitative Inputs!E4"
 
 # Load credentials (Service Account in this example)
+import os
+KEY_PATH = "/etc/secrets/service_account.json"  # Path where Render stores the secret
 creds = service_account.Credentials.from_service_account_file(
-    "service_account.json",
+    KEY_PATH,
     scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
 )
 service = build("sheets", "v4", credentials=creds)
@@ -116,3 +119,4 @@ def create_chart():
     img_base64 = base64.b64encode(img_buffer.read()).decode("utf-8")
 
     return JSONResponse(content={"image_base64": img_base64})
+
