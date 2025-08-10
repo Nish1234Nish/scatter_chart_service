@@ -1,122 +1,159 @@
+# chart_service.py
+# FastAPI service that reads rectangle defs + a point from Google Sheets,
+# renders a custom scatter with colored rectangles + wrapped labels,
+# and returns a PNG as base64. Ready for Render.com (no Dockerfile needed).
+
 import matplotlib
-matplotlib.use("Agg")import io
-import base64
+matplotlib.use("Agg")  # headless backend for servers
+
+import os, io, base64, textwrap, traceback
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-import textwrap
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-# ---- CONFIG ----
-SHEET_ID = "1NZ1KSX3gn6XRcWwLY7BRhLDXLVtVIFxdhjAsk-9Fy_A"  # <-- Replace with your actual Google Sheet ID
-RECT_RANGE = "Backend (Qualitative)!E90:J101"
-POINT_X_CELL = "Qualitative Inputs!N25"
-POINT_Y_CELL = "Qualitative Inputs!E4"
+# ==== CONFIG (you can change these if your ranges/sheet names move) ====
+SHEET_ID = "1NZ1KSX3gn6XRcWwLY7BRhLDXLVtVIFxdhjAsk-9Fy_A"  # your sheet
+RECT_RANGE = "'Backend (Qualitative)'!E90:J101"            # header at row 90
+POINT_X_CELL = "'Qualitative Inputs'!N25"                  # X = Health
+POINT_Y_CELL = "'Qualitative Inputs'!E4"                   # Y = Exit
+X_LABEL = "Health"
+Y_LABEL = "Exit"
+AX_MIN, AX_MAX = 0.0, 10.0
 
-# Load credentials (Service Account in this example)
-import os
-KEY_PATH = "/etc/secrets/service_account.json"  # Path where Render stores the secret
-creds = service_account.Credentials.from_service_account_file(
-    KEY_PATH,
-    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
-)
-service = build("sheets", "v4", credentials=creds)
+# Render Secret Files mount here by default:
+DEFAULT_KEY_PATH = "/etc/secrets/service_account.json"
 
 app = FastAPI()
 
-def fit_text_to_rect(ax, text, x_center, y_center, width, height, max_fontsize=12, min_fontsize=6):
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+def get_sheets_service():
     """
-    Automatically wrap and scale text to fit inside a rectangle.
+    Initialize Google Sheets API client using a service-account key.
+    On Render, store the JSON as a Secret File named 'service_account.json'.
     """
-    for fontsize in range(max_fontsize, min_fontsize - 1, -1):
-        wrapped = textwrap.fill(text, width=int(width * 4))  # Adjust wrap based on rect width
-        text_obj = ax.text(
-            x_center, y_center, wrapped,
-            ha='center', va='center',
-            fontsize=fontsize, wrap=True
+    key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", DEFAULT_KEY_PATH)
+    if not os.path.exists(key_path):
+        raise FileNotFoundError(
+            f"Service account key not found at '{key_path}'. "
+            "On Render, add a Secret File named service_account.json."
         )
-        # Renderer check to see if it fits
+    creds = service_account.Credentials.from_service_account_file(
+        key_path,
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    return build("sheets", "v4", credentials=creds)
+
+
+def fit_text_to_rect(ax, text, x_center, y_center, width, height,
+                     max_fontsize=12, min_fontsize=6):
+    """
+    Wraps and scales text so it fits inside a rectangle (in data units).
+    Tries larger font sizes first, then shrinks until it fits.
+    """
+    safe_width = max(width, 0.1)
+    safe_height = max(height, 0.1)
+
+    for fontsize in range(max_fontsize, min_fontsize - 1, -1):
+        # Heuristic wrap length based on rect width in axis units
+        wrap_chars = max(10, int(safe_width * 4))
+        wrapped = textwrap.fill(text or "", width=wrap_chars)
+
+        txt = ax.text(
+            x_center, y_center, wrapped,
+            ha="center", va="center",
+            fontsize=fontsize, wrap=True,
+        )
+        # Ask the renderer for the size in data coordinates
         ax.figure.canvas.draw()
-        bbox = text_obj.get_window_extent(renderer=ax.figure.canvas.get_renderer())
-        inv = ax.transData.inverted()
-        bbox_data = bbox.transformed(inv)
-        if bbox_data.width <= width and bbox_data.height <= height:
-            return  # Found a font size that fits
-        text_obj.remove()
+        renderer = ax.figure.canvas.get_renderer()
+        bbox_disp = txt.get_window_extent(renderer=renderer)
+        bbox_data = bbox_disp.transformed(ax.transData.inverted())
+        if bbox_data.width <= safe_width and bbox_data.height <= safe_height:
+            return  # fits—keep this text object
+        txt.remove()  # too big—try smaller
+
+    # If nothing fit, place smallest anyway (clipped gracefully)
+    ax.text(
+        x_center, y_center, textwrap.fill(text or "", width=wrap_chars),
+        ha="center", va="center", fontsize=min_fontsize, wrap=True
+    )
+
 
 @app.get("/chart")
-def create_chart():
-    # ---- Fetch rectangles ----
-    rect_data = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=RECT_RANGE
-    ).execute().get("values", [])
+def chart():
+    try:
+        service = get_sheets_service()
 
-    if not rect_data or len(rect_data) < 2:
-        return JSONResponse(content={"error": "No rectangle data found"}, status_code=400)
+        # --- Fetch rectangles (expects header row at E90:J90) ---
+        resp = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=RECT_RANGE
+        ).execute()
+        values = resp.get("values", [])
+        if not values or len(values) < 2:
+            raise ValueError(f"No rectangle data found in {RECT_RANGE}")
 
-    rects = []
-    for row in rect_data[1:]:  # Skip header row
-        if len(row) < 6:
-            continue
-        rects.append({
-            "x_min": float(row[0]),
-            "x_max": float(row[1]),
-            "y_min": float(row[2]),
-            "y_max": float(row[3]),
-            "fill_color": row[4],
-            "text": row[5]
-        })
+        # Header row: x_min,x_max,y_min,y_max,fill_colour,text_content
+        rects = []
+        for row in values[1:]:
+            if len(row) < 6:
+                continue
+            try:
+                x_min = float(row[0]); x_max = float(row[1])
+                y_min = float(row[2]); y_max = float(row[3])
+            except ValueError:
+                # Skip rows with non-numeric coords
+                continue
+            fill = row[4].strip() if len(row) > 4 else "#FFFFFF"
+            text = row[5] if len(row) > 5 else ""
+            if x_max <= x_min or y_max <= y_min:
+                continue  # skip degenerate rectangles
+            rects.append((x_min, x_max, y_min, y_max, fill, text))
 
-    # ---- Fetch point ----
-    x_score = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range=POINT_X_CELL
-    ).execute().get("values", [["0"]])[0][0]
+        if not rects:
+            raise ValueError("No valid rectangle rows after parsing.")
 
-    y_score = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range=POINT_Y_CELL
-    ).execute().get("values", [["0"]])[0][0]
+        # --- Fetch point (X from N25, Y from E4) ---
+        x_raw = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=POINT_X_CELL
+        ).execute().get("values", [["0"]])[0][0]
+        y_raw = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=POINT_Y_CELL
+        ).execute().get("values", [["0"]])[0][0]
+        x_score = float(x_raw)
+        y_score = float(y_raw)
 
-    x_score = float(x_score)
-    y_score = float(y_score)
+        # --- Build chart ---
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.set_xlim(AX_MIN, AX_MAX)
+        ax.set_ylim(AX_MIN, AX_MAX)
+        ax.set_xlabel(X_LABEL, fontsize=12)
+        ax.set_ylabel(Y_LABEL, fontsize=12)
 
-    # ---- Build chart ----
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 10)
-    ax.set_xlabel("Health", fontsize=12)
-    ax.set_ylabel("Exit", fontsize=12)
+        # draw rectangles + wrapped labels
+        for x_min, x_max, y_min, y_max, fill, text in rects:
+            W = x_max - x_min
+            H = y_max - y_min
+            ax.add_patch(Rectangle(
+                (x_min, y_min), W, H,
+                facecolor=fill, edgecolor="black", linewidth=0.5, zorder=1
+            ))
+            fit_text_to_rect(ax, text, x_min + W/2, y_min + H/2, W, H)
 
-    for r in rects:
-        width = r["x_max"] - r["x_min"]
-        height = r["y_max"] - r["y_min"]
+        # scatter point on top
+        ax.scatter([x_score], [y_score], s=80, zorder=5)
 
-        rect_patch = Rectangle(
-            (r["x_min"], r["y_min"]),
-            width,
-            height,
-            facecolor=r["fill_color"],
-            edgecolor="black",
-            linewidth=0.5
-        )
-        ax.add_patch(rect_patch)
-
-        # Auto-fit wrapped text
-        fit_text_to_rect(ax, r["text"], r["x_min"] + width/2, r["y_min"] + height/2, width, height)
-
-    # ---- Plot point ----
-    ax.scatter([x_score], [y_score], color="red", s=80, zorder=5)
-
-    plt.tight_layout()
-
-    # ---- Convert to base64 ----
-    img_buffer = io.BytesIO()
-    plt.savefig(img_buffer, format="png", dpi=150)
-    plt.close(fig)
-    img_buffer.seek(0)
-    img_base64 = base64.b64encode(img_buffer.read()).decode("utf-8")
-
-    return JSONResponse(content={"image_base64": img_base64})
+        # export as PNG → base64
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=150)
+        plt.close(fig)
+        buf.seek(0)
 
