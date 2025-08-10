@@ -1,39 +1,44 @@
 # chart_service.py
-# FastAPI service that reads rectangles + a point from Google Sheets,
-# renders a custom scatter with colored rectangles + wrapped labels,
-# and returns a PNG as base64. Render.com compatible (no Dockerfile needed).
+# FastAPI service: reads rectangles + a point from Google Sheets,
+# renders a custom scatter with colored rectangles + wrapped text,
+# returns a PNG as base64. Ready for Render.com (no Dockerfile needed).
 
 import matplotlib
 matplotlib.use("Agg")  # headless backend for servers
 
-import os, io, base64, textwrap, traceback
+import os, io, base64, textwrap, traceback, re
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from matplotlib import colors as mcolors
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ==== CONFIG ====
+# ========= CONFIG =========
 SHEET_ID = "1NZ1KSX3gn6XRcWwLY7BRhLDXLVtVIFxdhjAsk-9Fy_A"
-RECT_RANGE = "'Backend (Qualitative)'!E90:J101"   # header row in 90
+RECT_RANGE = "'Backend (Qualitative)'!E90:J101"   # header row at 90: x_min,x_max,y_min,y_max,fill_colour,text_content
 POINT_X_CELL = "'Qualitative Inputs'!N25"         # X = Health
 POINT_Y_CELL = "'Qualitative Inputs'!E4"          # Y = Exit
+
 X_LABEL = "Health"
 Y_LABEL = "Exit"
 AX_MIN, AX_MAX = 0.0, 10.0
+FIG_W, FIG_H = 8, 8             # inches
+DPI = int(os.getenv("CHART_DPI", "110"))  # 8in * 110dpi = 880px (<=1M pixels, <=2MB)
 
-# Render Secret Files live here:
 DEFAULT_KEY_PATH = "/etc/secrets/service_account.json"
 
 app = FastAPI()
+
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
+
 def get_sheets_service():
-    """Init Google Sheets API client using a service-account key."""
+    """Initialize Google Sheets API client using a service-account key."""
     key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", DEFAULT_KEY_PATH)
     if not os.path.exists(key_path):
         raise FileNotFoundError(
@@ -46,41 +51,65 @@ def get_sheets_service():
     )
     return build("sheets", "v4", credentials=creds)
 
-def fit_text_to_rect(ax, text, x_center, y_center, width, height,
-                     max_fontsize=12, min_fontsize=6):
-    """Wrap & scale text so it fits inside a rectangle (axis units)."""
-    safe_w = max(width, 0.1)
-    safe_h = max(height, 0.1)
-    for fontsize in range(max_fontsize, min_fontsize - 1, -1):
-        wrap_chars = max(10, int(safe_w * 4))
+
+def normalize_color(val: str, default="#ffffff") -> str:
+    """Normalize Sheet color strings to canonical #rrggbb; tolerate spaces/3- or 6-hex, case, missing '#'. """
+    if not val:
+        return default
+    s = str(val).strip().lower()
+    s = re.sub(r"\s+", "", s)      # remove spaces/newlines
+    if not s.startswith("#") and len(s) in (3, 6):
+        s = "#" + s
+    try:
+        return mcolors.to_hex(mcolors.to_rgba(s))  # -> '#rrggbb'
+    except ValueError:
+        return default
+
+
+def draw_wrapped_left(ax, text, x_min, y_max, width, height,
+                      pad=0.2, max_fontsize=12, min_fontsize=6):
+    """
+    Left-align wrapped text inside the rectangle with padding.
+    Shrinks font size until it fits within (width - 2*pad, height - 2*pad).
+    """
+    avail_w = max(width - 2 * pad, 0.1)
+    avail_h = max(height - 2 * pad, 0.1)
+    x = x_min + pad      # left padding
+    y = y_max - pad      # top padding (using y_max as top)
+
+    # try larger font sizes first, then shrink
+    for fs in range(max_fontsize, min_fontsize - 1, -1):
+        wrap_chars = max(10, int(avail_w * 4))  # heuristic: 4 chars per axis unit
         wrapped = textwrap.fill(text or "", width=wrap_chars)
-        t = ax.text(x_center, y_center, wrapped,
-                    ha="center", va="center",
-                    fontsize=fontsize, wrap=True)
+        t = ax.text(x, y, wrapped,
+                    ha="left", va="top",
+                    fontsize=fs, wrap=True, multialignment="left")
         ax.figure.canvas.draw()
         rend = ax.figure.canvas.get_renderer()
         bbox = t.get_window_extent(renderer=rend).transformed(ax.transData.inverted())
-        if bbox.width <= safe_w and bbox.height <= safe_h:
-            return
+        if bbox.width <= avail_w and bbox.height <= avail_h:
+            return  # it fits; keep the text
         t.remove()
-    # fallback (smallest size)
-    ax.text(x_center, y_center, textwrap.fill(text or "", width=wrap_chars),
-            ha="center", va="center", fontsize=min_fontsize, wrap=True)
+
+    # fallback: smallest font, clipped if needed
+    wrap_chars = max(10, int(avail_w * 4))
+    ax.text(x, y, textwrap.fill(text or "", width=wrap_chars),
+            ha="left", va="top", fontsize=min_fontsize, wrap=True, multialignment="left")
+
 
 @app.get("/chart")
 def chart():
     try:
         svc = get_sheets_service()
 
-        # --- Rectangles ---
-        rect_vals = svc.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range=RECT_RANGE
-        ).execute().get("values", [])
-        if not rect_vals or len(rect_vals) < 2:
+        # ---- Rectangles ----
+        resp = svc.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=RECT_RANGE).execute()
+        values = resp.get("values", [])
+        if not values or len(values) < 2:
             raise ValueError(f"No rectangle data found in {RECT_RANGE}")
 
         rects = []
-        for row in rect_vals[1:]:
+        for row in values[1:]:
             if len(row) < 6:
                 continue
             try:
@@ -88,7 +117,8 @@ def chart():
                 y_min = float(row[2]); y_max = float(row[3])
             except Exception:
                 continue
-            fill = (row[4] or "").strip() if len(row) > 4 else "#FFFFFF"
+            fill_raw = row[4] if len(row) > 4 else "#ffffff"
+            fill = normalize_color(fill_raw, default="#fff2cc")  # default pastel
             text = row[5] if len(row) > 5 else ""
             if x_max <= x_min or y_max <= y_min:
                 continue
@@ -97,7 +127,7 @@ def chart():
         if not rects:
             raise ValueError("No valid rectangle rows after parsing.")
 
-        # --- Point (X from N25, Y from E4) ---
+        # ---- Point (X from N25, Y from E4) ----
         x_raw = svc.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range=POINT_X_CELL
         ).execute().get("values", [["0"]])[0][0]
@@ -106,23 +136,30 @@ def chart():
         ).execute().get("values", [["0"]])[0][0]
         x_score = float(x_raw); y_score = float(y_raw)
 
-        # --- Plot ---
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.set_xlim(AX_MIN, AX_MAX); ax.set_ylim(AX_MIN, AX_MAX)
-        ax.set_xlabel(X_LABEL, fontsize=12); ax.set_ylabel(Y_LABEL, fontsize=12)
+        # ---- Plot ----
+        fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+        ax.set_xlim(AX_MIN, AX_MAX)
+        ax.set_ylim(AX_MIN, AX_MAX)
+        ax.set_xlabel(X_LABEL, fontsize=12)
+        ax.set_ylabel(Y_LABEL, fontsize=12)
 
+        # Draw rectangles first (no borders), then text, then point
         for x_min, x_max, y_min, y_max, fill, text in rects:
             W = x_max - x_min; H = y_max - y_min
-            ax.add_patch(Rectangle((x_min, y_min), W, H,
-                                   facecolor=fill, edgecolor="black",
-                                   linewidth=0.5, zorder=1))
-            fit_text_to_rect(ax, text, x_min + W/2, y_min + H/2, W, H)
+            ax.add_patch(Rectangle(
+                (x_min, y_min), W, H,
+                facecolor=fill, edgecolor="none", linewidth=0.0, zorder=1
+            ))
+            # text: left-aligned, wrapped, padded; start from top-left (y_max)
+            draw_wrapped_left(ax, text, x_min, y_max, W, H, pad=0.2)
 
+        # Scatter point on top
         ax.scatter([x_score], [y_score], s=80, zorder=5)
 
+        # Export as PNG → base64
         buf = io.BytesIO()
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=110)
+        plt.savefig(buf, format="png", dpi=DPI)
         plt.close(fig)
         buf.seek(0)
         b64 = base64.b64encode(buf.read()).decode("utf-8")
@@ -132,7 +169,8 @@ def chart():
         detail = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}"
         raise HTTPException(status_code=500, detail=detail)
 
-# Optional local run (ignored by Render)
+
+# Optional: local debug
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
