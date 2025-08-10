@@ -122,7 +122,7 @@ def chart():
 
         buf = io.BytesIO()
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=150)
+        plt.savefig(buf, format="png", dpi=110)
         plt.close(fig)
         buf.seek(0)
         b64 = base64.b64encode(buf.read()).decode("utf-8")
@@ -137,3 +137,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
